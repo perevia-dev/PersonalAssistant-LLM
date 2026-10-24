@@ -7,7 +7,8 @@ No channel I/O, model SDK, filesystem, or plugins are imported here.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace as dataclass_replace
 from time import monotonic
 from typing import Awaitable, Callable, Literal
 
@@ -182,7 +183,51 @@ class CycleResult:
     reason: str = ""
 
     def tool_feedback(self) -> str:
-        return "\n".join(receipt.as_context() for receipt in self.receipts)[:1200]
+        """Bounded evidence with explicit outcome; preserve complete receipt lines."""
+        if not self.receipts:
+            return ""
+        lines = [
+            f"工具循环已结束；原因={self.reason or 'planner_finished'}；"
+            f"成功={sum(r.success for r in self.receipts)}；"
+            f"失败={sum(not r.success for r in self.receipts)}。",
+            "已经执行的工具不得再次表述为即将执行；只根据以下回执回答，"
+            "未获得的内容不可编造。",
+        ]
+        for receipt in self.receipts:
+            line = receipt.as_context()
+            if len("\n".join(lines + [line])) > 1200:
+                lines.append("其余回执因上下文预算限制未展示。")
+                break
+            lines.append(line)
+        return "\n".join(lines)[:1200]
+
+
+
+def _search_terms(query: str) -> set[str]:
+    """Conservative language-independent anchors for same-turn search checks."""
+    words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", query.casefold())
+    terms: set[str] = set()
+    for word in words:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", word):
+            terms.update(word[i:i+2] for i in range(len(word)-1))
+        elif len(word) >= 3:
+            terms.add(word)
+    return terms
+
+
+def _search_relation(previous: str, proposed: str) -> str:
+    """Detect near-repeat or unrelated query, without claiming full semantics."""
+    old, new = _search_terms(previous), _search_terms(proposed)
+    if not old or not new:
+        return "unknown"
+    common = len(old & new)
+    overlap = common / min(len(old), len(new))
+    similarity = common / len(old | new)
+    if similarity >= .72:
+        return "duplicate"
+    if overlap < .18:
+        return "topic_drift"
+    return "related"
 
 
 class AgentCycleEngine:
@@ -211,25 +256,46 @@ class AgentCycleEngine:
         allow_silence: bool = False,
         already_waited: bool = False,
         tool_timeout: float = 6.0,
+        on_event: Callable[[str, int, str], None] | None = None,
     ) -> CycleResult:
         deadline = monotonic() + self.total_timeout
         receipts: list[ToolReceipt] = []
         invoked: set[tuple[str, str]] = set()
         tools_used = 0
+        previous_searches: list[str] = []
         fallback = PlanDecision()
+
+        def emit(event: str, round_no: int, detail: str = "") -> None:
+            if on_event is not None:
+                try:
+                    on_event(event, round_no, detail)
+                except Exception:
+                    pass  # Diagnostics must never change action execution.
+
+        def finalize(plan: PlanDecision, reason: str, round_no: int) -> CycleResult:
+            # A request to use a tool is never a valid final reply instruction.
+            # Keep the character/tone, but clear stale tool intent and arguments.
+            if plan.action == "tool":
+                plan = dataclass_replace(plan, action="reply",
+                    reply_act="依据已经执行的工具回执回答当前问题；不要称正在准备查询",
+                    tool_name="", tool_arguments=None, selection_reason="")
+            emit("finalize", round_no, reason)
+            return CycleResult(plan, "reply", tuple(receipts), round_no, reason)
+
         for round_no in range(1, self.max_rounds + 1):
             remaining = deadline - monotonic()
             if remaining <= 0:
-                return CycleResult(fallback, "reply", tuple(receipts), round_no-1, "total_timeout")
+                return finalize(fallback, "total_timeout", round_no-1)
             try:
                 plan = await asyncio.wait_for(planner(tuple(receipts)), timeout=remaining)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                return CycleResult(fallback, "reply", tuple(receipts), round_no, "planner_failure")
+                return finalize(fallback, "planner_failure", round_no)
             if not isinstance(plan, PlanDecision):
-                return CycleResult(fallback, "reply", tuple(receipts), round_no, "invalid_plan")
+                return finalize(fallback, "invalid_plan", round_no)
             fallback = plan
+            emit("plan", round_no, plan.action if plan.action != "tool" else f"tool:{plan.tool_name}")
             authorized = bool(
                 allow_tools and registry is not None
                 and registry.available(plan.tool_name, scope=scope, allow_mutation=allow_mutation)
@@ -237,25 +303,40 @@ class AgentCycleEngine:
             action = choose_action(plan, allow_silence=allow_silence,
                                    already_waited=already_waited, tools_enabled=authorized)
             if action != "tool":
+                emit("action", round_no, action if action == plan.action else f"{plan.action}->{action}")
                 reason = "tool_denied" if plan.action == "tool" else ""
                 return CycleResult(plan, action, tuple(receipts), round_no, reason)
+            if plan.tool_name == "web_search.search" and previous_searches:
+                query = (plan.tool_arguments or {}).get("query", "")
+                if isinstance(query, str):
+                    relations = [_search_relation(q, query) for q in previous_searches]
+                    if "duplicate" in relations:
+                        return finalize(plan, "duplicate_search", round_no)
+                    if "related" not in relations and "unknown" not in relations:
+                        return finalize(plan, "search_topic_drift", round_no)
             if tools_used >= self.max_tools or round_no >= self.max_rounds:
-                return CycleResult(plan, "reply", tuple(receipts), round_no, "budget_exhausted")
+                return finalize(plan, "budget_exhausted", round_no)
             key = (plan.tool_name, repr(sorted((plan.tool_arguments or {}).items())))
             if key in invoked:
-                return CycleResult(plan, "reply", tuple(receipts), round_no, "duplicate_tool")
+                return finalize(plan, "duplicate_tool", round_no)
             invoked.add(key)
             tools_used += 1
             remaining = deadline - monotonic()
             if remaining <= 0:
-                return CycleResult(plan, "reply", tuple(receipts), round_no, "total_timeout")
+                return finalize(plan, "total_timeout", round_no)
+            emit("tool_start", round_no, plan.tool_name)
             receipt = await registry.invoke(
                 plan.tool_name, plan.tool_arguments or {},
                 scope=scope, allow_mutation=allow_mutation,
                 timeout=min(tool_timeout, remaining),
             )
             receipts.append(receipt)
+            emit("tool_end", round_no, f"{plan.tool_name}:{'success' if receipt.success else 'failure'}")
+            if receipt.success and plan.tool_name == "web_search.search":
+                query = (plan.tool_arguments or {}).get("query", "")
+                if isinstance(query, str):
+                    previous_searches.append(query)
             # Failed tools do not trigger repeated retries or pretend success.
             if not receipt.success:
-                return CycleResult(plan, "reply", tuple(receipts), round_no, "tool_failed")
-        return CycleResult(fallback, "reply", tuple(receipts), self.max_rounds, "budget_exhausted")
+                return finalize(plan, "tool_failed", round_no)
+        return finalize(fallback, "budget_exhausted", self.max_rounds)
